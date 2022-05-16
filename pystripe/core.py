@@ -1,7 +1,10 @@
 import argparse
+import shutil
 from argparse import RawDescriptionHelpFormatter
 from pathlib import Path
 import os
+from urllib.parse import urlparse
+
 import numpy as np
 from scipy import fftpack, ndimage
 from skimage.filters import threshold_otsu
@@ -37,13 +40,15 @@ def _get_extension(path):
     return Path(path).suffix
 
 
-def imread(path):
+def imread(path, tmp_dir=None):
     """Load a tiff or raw image
 
     Parameters
     ----------
     path : str
         path to tiff or raw image
+    tmp_dir : str
+        temporary directory to write image file, only applies if reading from cloud storage
 
     Returns
     -------
@@ -52,11 +57,36 @@ def imread(path):
 
     """
     img = None
-    extension = _get_extension(path)
-    if extension == '.raw':
-        img = raw.raw_imread(path)
-    elif extension == '.tif' or extension == '.tiff':
-        img = tifffile.imread(path)
+    if _is_gcloud_uri(path):
+        from google.cloud import storage
+        from urllib.parse import urlparse
+
+        # Instantiates a client
+        storage_client = storage.Client()
+
+        bucket = storage_client.bucket(urlparse(path).netloc)
+        # remove leading '/'
+        blob_name = urlparse(path).path[1:]
+        blob = bucket.blob(blob_name)
+
+        if tmp_dir is None:
+            tmp_dir = os.getcwd()
+        tmp_fpath = os.path.join(tmp_dir, blob_name)
+        Path(tmp_fpath).parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            blob.download_to_filename(tmp_fpath)
+            img = tifffile.imread(tmp_fpath)
+        finally:
+            os.remove(tmp_fpath)
+    else:
+        # We are running on a traditional filesystem
+        extension = _get_extension(path)
+        if extension == '.raw':
+            img = raw.raw_imread(path)
+        elif extension == '.tif' or extension == '.tiff':
+            img = tifffile.imread(path)
+
     return img
 
 
@@ -120,7 +150,7 @@ def check_dcimg_start(path):
     return int(os.path.basename(path).split('.')[0])
 
 
-def imsave(path, img, compression=1):
+def imsave(path, img, compression=1, tmp_dir=None):
     """Save an array as a tiff or raw image
 
     The file format will be inferred from the file extension in `path`
@@ -133,15 +163,43 @@ def imsave(path, img, compression=1):
         image as a numpy array
     compression : int
         compression level for tiff writing
+    tmp_dir : str
+        directory to write temporary image file, only applies if writing to cloud storage
 
     """
-    extension = _get_extension(path)
-    if extension == '.raw':
-        # TODO: get raw writing to work
-        # raw.raw_imsave(path, img)
-        tifffile.imsave(os.path.splitext(path)[0]+'.tif', img, compress=compression)
-    elif extension == '.tif' or extension == '.tiff':
-        tifffile.imsave(path, img, compress=compression)
+    if _is_gcloud_uri(path):
+        from google.cloud import storage
+        from urllib.parse import urlparse
+
+        # Instantiates a client
+        storage_client = storage.Client()
+
+        bucket = storage_client.bucket(urlparse(path).netloc)
+
+        # remove leading '/'
+        blob_name = urlparse(path).path[1:]
+        blob = bucket.blob(blob_name)
+
+        if tmp_dir is None:
+            tmp_dir = os.getcwd()
+        tmp_fpath = os.path.join(tmp_dir, blob_name)
+        Path(tmp_fpath).parent.mkdir(parents=True, exist_ok=True)
+
+        tifffile.imwrite(tmp_fpath, img, compress=compression)
+
+        try:
+            blob.upload_from_filename(tmp_fpath)
+        finally:
+            os.remove(tmp_fpath)
+
+    else:
+        extension = _get_extension(path)
+        if extension == '.raw':
+            # TODO: get raw writing to work
+            # raw.raw_imsave(path, img)
+            tifffile.imsave(os.path.splitext(path)[0]+'.tif', img, compress=compression)
+        elif extension == '.tif' or extension == '.tiff':
+            tifffile.imsave(path, img, compress=compression)
 
 
 def wavedec(img, wavelet, level=None):
@@ -491,7 +549,8 @@ def read_filter_save(input_path, output_path, sigma, level=0, wavelet='db3',
                      background_window_size=200,
                      percentile=.25,
                      lightsheet_vs_background=2.0,
-                     dont_convert_16bit=False):
+                     dont_convert_16bit=False,
+                     tmp_dir=None):
 
     """Convenience wrapper around filter streaks. Takes in a path to an image rather than an image array
 
@@ -535,10 +594,12 @@ def read_filter_save(input_path, output_path, sigma, level=0, wavelet='db3',
         weighting factor to use background or lightsheet background
     dont_convert_16bit : bool
         Flag for converting to 16-bit
+    tmp_dir: str
+        directory to write temporary image files, only applies if reading/writing to cloud storage
     """
     if z_idx is None:
         # Path must be TIFF or RAW
-        img = imread(str(input_path))
+        img = imread(str(input_path), tmp_dir=tmp_dir)
         dtype = img.dtype
         if not dont_convert_16bit:
             dtype = np.uint16
@@ -569,7 +630,7 @@ def read_filter_save(input_path, output_path, sigma, level=0, wavelet='db3',
     # Save image, retry if OSError for NAS
     for _ in range(nb_retry):
         try:
-            imsave(str(output_path), fimg.astype(dtype), compression=compression)
+            imsave(str(output_path), fimg.astype(dtype), compression=compression, tmp_dir=tmp_dir)
         except OSError:
             print('Retrying...')
             continue
@@ -634,6 +695,29 @@ def _find_all_images(input_path, zstep=None):
     return img_paths
 
 
+def _find_all_images_gcs(input_path):
+    from google.cloud import storage
+
+    client = storage.Client()
+
+    bucket_name = urlparse(input_path).netloc
+    print("Looking for images in bucket: " + bucket_name)
+    bucket = client.get_bucket(bucket_name)
+
+    # FIXME only .tiff images are currently supported
+    supported_extensions = [".tif", ".tiff"]
+    img_uris = []
+    prefix = urlparse(input_path).path
+    # remove leading '/'
+    prefix = prefix[1:]
+    for blob in bucket.list_blobs(prefix=prefix):
+        if os.path.splitext(blob.name)[1] in supported_extensions:
+            link = 'gs://' + bucket_name + '/' + blob.name
+            img_uris.append(link)
+
+    return img_uris
+
+
 def batch_filter(input_path, output_path, workers, chunks, sigma, level=0, wavelet='db3', crossover=10,
                  threshold=-1, compression=1, flat=None, dark=0, zstep=None, rotate=False,
                  lightsheet=False,
@@ -641,7 +725,8 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, level=0, wavel
                  background_window_size=200,
                  percentile=.25,
                  lightsheet_vs_background=2.0,
-                 dont_convert_16bit=False
+                 dont_convert_16bit=False,
+                 tmp_dir=None
                  ):
     """Applies `streak_filter` to all images in `input_path` and write the results to `output_path`.
 
@@ -677,11 +762,16 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, level=0, wavel
         Flag for 90 degree rotation.
     dont_convert_16bit : bool
         Flag for converting to 16-bit
+    tmp_dir: str
+        directory to write temporary image files, only applies if reading/writing to cloud storage
     """
     if workers == 0:
         workers = multiprocessing.cpu_count()
     print('Looking for images in {}...'.format(input_path))
-    img_paths = _find_all_images(input_path, zstep)
+    if _is_gcloud_uri(input_path):
+        img_paths = _find_all_images_gcs(input_path)
+    else:
+        img_paths = _find_all_images(input_path, zstep)
     print('Found {} compatible images'.format(len(img_paths)))
     print('Setting up {} workers...'.format(workers))
     args = []
@@ -691,10 +781,12 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, level=0, wavel
             rel_path = p.relative_to(input_path).parent.joinpath('{:04d}.tif'.format(z))
         else:  # TIFF or RAW found
             z_idx = None
-            rel_path = p.relative_to(input_path)
-        o = output_path.joinpath(rel_path)
-        if not o.parent.exists():
-            o.parent.mkdir(parents=True)
+            rel_path = os.path.relpath(p, input_path)
+            #rel_path = p.relative_to(input_path)
+        o = os.path.join(output_path, rel_path)
+        #o = output_path.joinpath(rel_path)
+        if not _is_gcloud_uri(o) and not Path(o).parent.exists():
+            Path(o).parent.mkdir(parents=True)
         arg_dict = {
             'input_path': p,
             'output_path': o,
@@ -713,7 +805,8 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, level=0, wavel
             'background_window_size': background_window_size,
             'percentile': percentile,
             'lightsheet_vs_background': lightsheet_vs_background,
-            'dont_convert_16bit' : dont_convert_16bit
+            'dont_convert_16bit' : dont_convert_16bit,
+            'tmp_dir': tmp_dir
         }
         args.append(arg_dict)
     print('Pystripe batch processing progress:')
@@ -725,6 +818,10 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, level=0, wavel
 def normalize_flat(flat):
     flat_float = flat.astype(np.float32)
     return flat_float / flat_float.max()
+
+
+def _is_gcloud_uri(path):
+    return str(path).startswith("gs:")
 
 
 def _parse_args():
@@ -765,7 +862,17 @@ def _parse_args():
 def main():
     args = _parse_args()
     sigma = [args.sigma1, args.sigma2]
-    input_path = Path(args.input)
+    is_gcs = False
+    tmp_dir = None
+    if _is_gcloud_uri(args.input):
+        input_path = args.input
+        is_gcs = True
+        tmp_dir = os.path.join(os.getcwd(), 'pystripe-tempfiles')
+        if os.path.isdir(tmp_dir):
+            shutil.rmtree(tmp_dir)
+        os.mkdir(tmp_dir)
+    else:
+        input_path = Path(args.input)
 
     flat = None
     if args.flat is not None:
@@ -778,7 +885,7 @@ def main():
     if args.dark < 0:
         raise ValueError('Only positive values for dark offset are allowed')
 
-    if input_path.is_file():  # single image
+    if not is_gcs and input_path.is_file():  # single image
         if input_path.suffix not in supported_extensions:
             print('Input file was found but is not supported. Exiting...')
             return
@@ -805,7 +912,7 @@ def main():
                          lightsheet_vs_background=args.lightsheet_vs_background,
                          dont_convert_16bit=args.dont_convert_16bit
                          )
-    elif input_path.is_dir():  # batch processing
+    elif not is_gcs and input_path.is_dir():  # batch processing
         if args.output == '':
             output_path = Path(input_path.parent).joinpath(str(input_path)+'_destriped')
         else:
@@ -832,8 +939,40 @@ def main():
                      lightsheet_vs_background=args.lightsheet_vs_background,
                      dont_convert_16bit=args.dont_convert_16bit
                      )
+    elif is_gcs:
+        if args.output == '':
+            output_path = input_path + "_destriped"
+        else:
+            output_path = args.output
+            assert os.path.splitext(output_path)[1] == ''
+        batch_filter(input_path,
+                     output_path,
+                     workers=args.workers,
+                     chunks=args.chunks,
+                     sigma=sigma,
+                     level=args.level,
+                     wavelet=args.wavelet,
+                     crossover=args.crossover,
+                     threshold=args.threshold,
+                     compression=args.compression,
+                     flat=flat,
+                     dark=args.dark,
+                     zstep=zstep,
+                     rotate=args.rotate,
+                     lightsheet=args.lightsheet,
+                     artifact_length=args.artifact_length,
+                     background_window_size=args.background_window_size,
+                     percentile=args.percentile,
+                     lightsheet_vs_background=args.lightsheet_vs_background,
+                     dont_convert_16bit=args.dont_convert_16bit,
+                     tmp_dir=tmp_dir
+                     )
     else:
         print('Cannot find input file or directory. Exiting...')
+
+    # clean up
+    if tmp_dir is not None:
+        shutil.rmtree(tmp_dir)
 
 
 if __name__ == "__main__":
