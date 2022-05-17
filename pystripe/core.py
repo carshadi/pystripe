@@ -690,6 +690,8 @@ def _find_all_images_gcs(input_path):
     prefix = urlparse(input_path).path
     # remove leading '/'
     prefix = prefix[1:]
+    prefix += '/'
+    print(prefix)
     for blob in bucket.list_blobs(prefix=prefix):
         if os.path.splitext(blob.name)[1] in supported_extensions:
             link = 'gs://' + bucket_name + '/' + blob.name
